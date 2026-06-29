@@ -1,0 +1,13 @@
+# Ruff config for the pymr launchers. The two entry points are extension-less
+# executables, so include them explicitly alongside the .py module.
+target-version = "py311"
+line-length = 100
+extend-include = ["bin/pymr", "bin/pyml"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "C4", "PIE", "PT", "PERF"]
+# BLE001: broad `except Exception` is intentional around best-effort RPC/IO and
+# optional imports — enumerating every transport error would be fragile.
+# PERF203: try-except inside loops is intentional in _set_states (per-item error
+# recovery) and _run_pml (continue on failed loads).
+ignore = ["BLE001", "PERF203"]

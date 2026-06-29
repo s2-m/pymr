@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""pymr — push structure files into a remote PyMOL over pymol_remote RPC.
+
+    pymr start [files...]      launch PyMOL with the RPC listener (the viewer)
+    pymr <files/dirs/globs>    push structures into the running listener
+
+`pymr start` opens a PyMOL that listens on $PYMOL_RPC_HOST:$PYMOL_RPC_PORT
+(default 127.0.0.1, port 9000 + UID % 1000). `pymr <files>` reads each file
+here, ships the bytes over RPC, and loads them on the listener — no shared
+filesystem needed (typically via an SSH tunnel:
+`ssh -R $PYMOL_RPC_PORT:localhost:$PYMOL_RPC_PORT remote-host`).
+
+Set $PYMR_PYMOL_BIN to use your own PyMOL (e.g. a full-featured build) as the
+listener; otherwise the bundled open-source PyMOL is used. Single-structure
+pushes use `atomworks.view_pymol` for normalized serialization (reads BCIF
+inputs); a raw byte-push fallback handles formats atomworks cannot serialize
+(e.g. density maps). Multi-file pushes ship raw bytes in batched `set_states`
+calls. The HTTP transport gzips request bodies, so no payload is pre-compressed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import re
+import shutil
+import sys
+
+from _pymr_common import (
+    SCRIPT_EXTENSIONS,
+    SESSION_EXTENSIONS,
+    STRUCTURE_EXTENSIONS,
+    UniqueNamer,
+    expand_inputs,
+    object_name,
+    resolve_token,
+)
+from atomworks.io.utils.visualize import view_pymol as _aw_view_pymol
+
+_BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+HOST = os.environ.get("PYMOL_RPC_HOST", "127.0.0.1")
+# Fallback default is UID-derived, so it differs per machine — pin
+# PYMOL_RPC_PORT to the same value on viewer and pusher to use a tunnel.
+PORT = int(os.environ.get("PYMOL_RPC_PORT", str(9000 + os.getuid() % 1000)))
+# Generous default: a single push waits on the server writing + loading the
+# file, which for a big structure can far exceed pymol_remote's 5 s default.
+TIMEOUT = float(os.environ.get("PYMR_TIMEOUT", "120"))
+# Structures per batched set_states RPC. Bounds pusher/server memory and keeps
+# each round-trip within the timeout when pushing thousands of designs at once.
+BATCH_CHUNK = max(1, int(os.environ.get("PYMR_BATCH_SIZE", "200")))
+_LOOPBACK_HOSTS = frozenset(("127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"))
+
+
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def cmd_start(extra: list[str]) -> None:
+    """Launch the listener and replace this process with it."""
+    # The listener accepts arbitrary code over RPC (do/python), so binding off
+    # loopback exposes code execution to anyone who can reach the port. Loopback
+    # + an SSH tunnel is the intended setup; warn loudly otherwise.
+    if HOST.lower() not in _LOOPBACK_HOSTS and not os.environ.get("PYMR_ALLOW_SHARED_HOST"):
+        print(
+            f"WARNING: binding the RPC listener to non-loopback host {HOST!r} exposes "
+            "arbitrary code execution to the network. Prefer loopback + an SSH tunnel; "
+            "set PYMR_ALLOW_SHARED_HOST=1 to silence this.",
+            file=sys.stderr,
+        )
+    binary = os.environ.get("PYMR_PYMOL_BIN") or _find_pymol_binary()
+    if binary:
+        _start_pymol(binary, extra)  # never returns
+
+    # No PyMOL binary to attach our bootstrap to: fall back to the plain
+    # pymol_remote console script (the listener works, just without the batch
+    # loader — the pusher degrades to per-file pushes).
+    launcher = _find_server_launcher()
+    if launcher:
+        # The fallback never runs our bootstrap, so token auth is NOT enforced.
+        # Refuse to silently expose an unauthenticated listener someone expected
+        # to be protected.
+        if resolve_token() and not os.environ.get("PYMR_ALLOW_NO_AUTH"):
+            die(
+                "A token is configured but no PyMOL binary was found, so the "
+                "fallback listener cannot enforce auth. Install open-source "
+                "PyMOL (`./install.sh`), set $PYMR_PYMOL_BIN, or set "
+                "PYMR_ALLOW_NO_AUTH=1 to start an UNAUTHENTICATED listener anyway."
+            )
+        os.execv(launcher, [launcher, *extra])
+    die(
+        "`pymr start` needs open-source PyMOL + pymol_remote. Run "
+        "`./install.sh` on this machine, or set $PYMR_PYMOL_BIN to your "
+        "own PyMOL build."
+    )
+
+
+def _find_pymol_binary() -> str | None:
+    candidate = os.path.join(os.path.dirname(sys.executable), "pymol")
+    return candidate if os.path.exists(candidate) else shutil.which("pymol")
+
+
+def _find_server_launcher() -> str | None:
+    candidate = os.path.join(os.path.dirname(sys.executable), "pymol_remote")
+    return candidate if os.path.exists(candidate) else shutil.which("pymol_remote")
+
+
+def _start_pymol(binary: str, extra: list[str]) -> None:
+    """Launch PyMOL with the pymol_remote server + pymr's batch loader attached.
+
+    The server is launched first (so the listener always comes up), then the
+    batch loader is registered best-effort. We put this launcher's dir (for
+    `_pymr_server`) and pymol_remote's parent (so even a separate PyMOL build
+    can import it) onto PYTHONPATH.
+    """
+    env = os.environ.copy()
+    paths = [_BIN_DIR]
+    try:
+        import pymol_remote
+
+        paths.append(os.path.dirname(os.path.dirname(os.path.abspath(pymol_remote.__file__))))
+    except ImportError:
+        pass
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(paths + ([existing] if existing else []))
+    # A leading "/" makes PyMOL run the deferred command as Python. Launch the
+    # server first so the listener is up even if the batch loader can't import.
+    # Pass hostname/port explicitly: the computed PORT default is not written to
+    # the environment, so pymol_remote.server.launch_server() would otherwise
+    # fall back to its own hardcoded default (9123). n_ports_to_try=1 binds
+    # exactly PORT (or fails loudly) — otherwise launch_server silently walks to
+    # PORT+1.. on a busy port, where the pusher (fixed PORT) could never find it.
+    # HOST goes through repr() so any value is a valid, escaped Python literal.
+    deferred = (
+        f"/import pymol_remote.server as _s; "
+        f"_s.launch_server(hostname={HOST!r}, port={PORT}, n_ports_to_try=1); "
+        "import _pymr_server; _pymr_server.register(_s)"
+    )
+    os.execvpe(binary, [binary, "-d", deferred, *extra], env)
+
+
+def _install_token_auth(transport_cls) -> None:
+    """Attach the shared secret as an ``X-Pymol-Token`` header on every request.
+
+    Patches the shared ``TimeoutTransport`` (idempotently) so both pymr's session
+    and atomworks' ``view_pymol`` path authenticate. No token → no header."""
+    if getattr(transport_cls, "_pymr_auth", False):
+        return
+    base_send_content = transport_cls.send_content
+
+    def send_content(self, connection, request_body):
+        token = resolve_token()
+        if token:
+            connection.putheader("X-Pymol-Token", token)
+        return base_send_content(self, connection, request_body)
+
+    transport_cls.send_content = send_content
+    transport_cls._pymr_auth = True
+
+
+def _connect():
+    from pymol_remote.client import PymolSession, TimeoutTransport
+
+    # The sole compression layer: gzip request bodies over ~1 KB at the HTTP
+    # layer, recovering XML-RPC's base64 inflation. The stock SimpleXMLRPCServer
+    # decodes gzip requests on its own, so this needs no server-side support.
+    if getattr(TimeoutTransport, "encode_threshold", None) is None:
+        TimeoutTransport.encode_threshold = 1024
+    _install_token_auth(TimeoutTransport)
+
+    try:
+        return PymolSession(hostname=HOST, port=PORT, timeout=TIMEOUT)
+    except Exception as exc:
+        hint = "Start one with `pymr start` (and open your SSH tunnel if remote)."
+        if "401" in str(exc):
+            hint = (
+                "The listener requires a token but yours is missing or wrong. "
+                "Copy the listener's token file (~/.config/pymr/token) here, or "
+                "set $PYMOL_RPC_TOKEN to the same value on both machines."
+            )
+        die(f"Could not connect to a pymr listener at {HOST}:{PORT}: {exc}\n{hint}")
+
+
+_EXT_TO_FORMAT: dict[str, str] = {
+    # PDB family
+    ".pdb": "pdb",
+    ".ent": "pdb",
+    ".p5m": "pdb",
+    ".pqr": "pqr",
+    ".pdbqt": "pdbqt",
+    # CIF family
+    ".cif": "cif",
+    ".mmcif": "cif",
+    ".bcif": "bcif",
+    # Small-molecule
+    ".mol": "mol",
+    ".mol2": "mol2",
+    ".sdf": "sdf",
+    ".sd": "sdf",
+    # Other coordinate formats
+    ".xyz": "xyz",
+    ".mae": "mae",
+    # Density / map formats
+    ".ccp4": "ccp4",
+    ".map": "ccp4",
+    ".mrc": "mrc",
+    ".xplor": "xplor",
+    ".dx": "dx",
+    ".cube": "cube",
+    ".dsn6": "brix",
+    ".brix": "brix",
+    ".omap": "brix",
+    # PyMOL pickle
+    ".pkl": "pkl",
+}
+
+
+def _file_format(path: str) -> str:
+    p = path.lower()
+    if p.endswith(".gz"):
+        p = p[:-3]
+    _, ext = os.path.splitext(p)
+    return _EXT_TO_FORMAT.get(ext, "cif")
+
+
+def _push_bytes(session, path: str, name: str) -> None:
+    """Push *path* to the listener via set_state, sending the raw file bytes.
+
+    No application-level compression: the HTTP transport already gzips request
+    bodies (see _connect), and pre-gzipping would only corrupt formats whose
+    PyMOL reader doesn't sniff the gzip magic (e.g. density maps, .pkl). Files
+    already gzipped on disk (.gz) are forwarded as-is — PyMOL detects them.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    session.do(f"delete {name}")
+    session.set_state(data, object=name, format=_file_format(path))
+
+
+def _server_has(session, name: str) -> bool:
+    try:
+        return name in session._available_commands
+    except Exception:
+        return False
+
+
+def _push_states_batch(session, items: list[tuple[str, str]]) -> int | None:
+    """Push many structures in a single `set_states` RPC call.
+
+    *items* is a list of (path, object_name). Returns the number of structures
+    the listener loaded, or None if it lacks `set_states` (so the caller falls
+    back to per-file pushes). Unreadable files are skipped with a warning rather
+    than aborting the whole call.
+    """
+    if not _server_has(session, "set_states"):
+        return None
+    payload = []
+    for path, name in items:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            print(f"  ! skipping {path}: {exc}", file=sys.stderr)
+            continue
+        payload.append([data, name, _file_format(path)])
+    if not payload:
+        return 0
+    loaded = session.set_states(payload)
+    # Older listeners' set_states may return None; assume the payload loaded.
+    return len(payload) if loaded is None else int(loaded)
+
+
+def _push_structure(session, path: str, name: str) -> None:
+    """Push via atomworks view_pymol (normalized CIF; reads BCIF inputs).
+
+    Falls back to a raw byte-push for formats atomworks can't handle (e.g. density maps).
+    """
+    try:
+        _aw_view_pymol(path, name, hostname=HOST, port=PORT, overwrite=True)
+    except Exception:
+        _push_bytes(session, path, name)
+
+
+def _push_session(session, path: str) -> None:
+    """Push a .pse/.pse.gz/.pze and load it on the listener (replaces the whole session)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    # Sent as-is: PyMOL loads plain .pse and sniffs the gzip magic of .pse.gz/.pze.
+    session.set_state(data, format="pse")
+    print(f"Loaded session: {path}")
+
+
+# Path may be quoted (spaces) or bare; an optional second field is the object name.
+_LOAD_RE = re.compile(
+    r"""^\s*load\s+("[^"]+"|'[^']+'|\S+?)(?:\s*,\s*([^\s,]+))?(\s*(?:,.*)?)\s*$""",
+    re.IGNORECASE,
+)
+
+
+def _maybe_intercept_load(line: str) -> tuple[str, str | None] | None:
+    """If *line* is `load <path>[, <name>]` for a structure readable here (with no
+    extra state/format args), return (abspath, name-or-None); else None."""
+    match = _LOAD_RE.match(line)
+    if not match:
+        return None
+    path = os.path.expanduser(match.group(1).strip("\"'"))
+    if not path.lower().endswith(STRUCTURE_EXTENSIONS) or not os.path.isfile(path):
+        return None
+    name = match.group(2)
+    # A keyword-style second arg (state=…, format=…) is not an object name and
+    # implies load semantics we can't reproduce by pushing bytes — pass it through.
+    if name and "=" in name:
+        return None
+    if (match.group(3) or "").strip().lstrip(",").strip():
+        return None
+    return os.path.abspath(path), name
+
+
+def _run_pml(session, path: str, namer: UniqueNamer) -> None:
+    """Replay a .pml with path resolution on the pusher side.
+
+    `load` lines for local structures push bytes, `python…python end` blocks
+    are sent whole, and everything else is forwarded line-by-line to the listener.
+    """
+    in_python = False
+    py_buf: list[str] = []
+    pushed = other = failed = 0
+    with open(path) as handle:
+        for raw in handle:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+            if in_python:
+                if stripped == "python end":
+                    session.python("\n".join(py_buf))
+                    py_buf, in_python = [], False
+                else:
+                    py_buf.append(line)
+                continue
+            if stripped == "python":
+                in_python = True
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.lower().startswith("load "):
+                hit = _maybe_intercept_load(stripped)
+                if hit is not None:
+                    load_path, given = hit
+                    name = namer.allocate(given or object_name(load_path))
+                    try:
+                        _push_structure(session, load_path, name)
+                        pushed += 1
+                    except Exception as exc:
+                        print(f"  ! load failed: {load_path}: {exc}")
+                        failed += 1
+                    continue
+                print(f"  ? passing through load (runs on listener): {stripped}")
+            session.do(stripped)
+            other += 1
+    if in_python:
+        print(f"Warning: unterminated `python` block in {path}")
+    print(f"Ran {path}  [{pushed} pushed, {other} other, {failed} failed]")
+
+
+def _read_key() -> str | None:
+    """Read one keypress (no Enter) and map it to an action, or None if unknown."""
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        # Only read the rest of an escape sequence if more bytes are already
+        # waiting, so a lone ESC keypress doesn't block on a 2-byte read.
+        if ch == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+            ch += sys.stdin.read(2)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    if ch in ("\x1b[C", "\x1b[B"):
+        return "next"
+    if ch in ("\x1b[D", "\x1b[A"):
+        return "prev"
+    low = ch.lower()
+    if ch in ("\r", "\n", " ") or low == "n":
+        return "next"
+    if low == "p":
+        return "prev"
+    if low == "q" or ch in ("\x03", "\x04"):
+        return "quit"
+    if low == "l":
+        return "list"
+    if low == "g":
+        return "goto"
+    if low in ("h", "?"):
+        return "help"
+    return None
+
+
+def _cycle(session, files: list[str]) -> None:
+    """Step through structures one at a time, deleting the previous object so the
+    listener's memory stays flat."""
+    if not files:
+        print("Nothing to cycle.")
+        return
+    state = {"i": -1, "obj": None}
+
+    def show(target: int) -> None:
+        idx = target % len(files)
+        path = files[idx]
+        obj = object_name(path)
+        if state["obj"]:
+            with contextlib.suppress(Exception):
+                session.do(f"delete {state['obj']}")
+        # Advance the cursor even on failure so 'next' steps past an unloadable
+        # file instead of re-showing it.
+        state["i"] = idx
+        try:
+            _push_structure(session, path, obj)
+            state["obj"] = obj
+            print(f"[{idx + 1}/{len(files)}] {obj}  <-  {path}")
+        except Exception as exc:
+            state["obj"] = None
+            print(f"Error loading {path}: {exc}")
+
+    def handle(action: str) -> bool:
+        if action == "next":
+            show(state["i"] + 1)
+        elif action == "prev":
+            show(state["i"] - 1)
+        elif action == "quit":
+            return False
+        elif action == "list":
+            for k, path in enumerate(files):
+                marker = ">" if k == state["i"] else " "
+                print(f" {marker} {k + 1:4d}  {path}")
+        elif action == "goto":
+            try:
+                show(int(input("goto #> ").strip()) - 1)
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print("  (cancelled)")
+        elif action == "help":
+            print("next: →/↓/n/space   prev: ←/↑/p   goto: g   list: l   quit: q")
+        return True
+
+    show(0)
+    print()
+    if sys.stdin.isatty():
+        print(
+            "→/↓/n/space = next   ←/↑/p = prev   g = goto   l = list   q = quit "
+            "(single keypress, no Enter)"
+        )
+        while True:
+            try:
+                action = _read_key()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            except Exception as exc:
+                print(f"(keypress mode unavailable: {exc}; type commands instead)")
+                break
+            if action is None:
+                continue
+            if not handle(action):
+                return
+
+    print("n/<Enter> = next | p = prev | g <N> = goto | l = list | q = quit")
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            show(state["i"] + 1)
+            continue
+        first = line[0].lower()
+        if first == "g":
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+                show(int(parts[1]) - 1)
+            else:
+                print("Usage: g <N>")
+            continue
+        action = {"n": "next", "p": "prev", "q": "quit", "l": "list"}.get(first)
+        if action is None:
+            print(f"? unknown: {line}   (n/p/g/l/q)")
+        elif not handle(action):
+            return
+
+
+def run_push(files: list[str], cycle: bool) -> int:
+    session = _connect()
+    print(f"Connected to listener at {HOST}:{PORT}")
+
+    if cycle:
+        structures = [f for f in files if f.lower().endswith(STRUCTURE_EXTENSIONS)]
+        if len(structures) != len(files):
+            print(f"(cycle mode ignores {len(files) - len(structures)} non-structure file(s))")
+        if not structures:
+            print("No structure files to cycle.")
+            return 0
+        _cycle(session, structures)
+        return 0
+
+    namer = UniqueNamer()
+    batch: list[tuple[str, str]] = []
+
+    def _push_per_file(chunk: list[tuple[str, str]]) -> int:
+        """Push each structure on its own, returning how many succeeded."""
+        done = 0
+        for path, name in chunk:
+            try:
+                _push_structure(session, path, name)
+                print(f"Loaded {name}  <-  {path}")
+                done += 1
+            except Exception as exc:
+                print(f"Error loading {path}: {exc}", file=sys.stderr)
+        return done
+
+    def flush_batch() -> None:
+        """Push the accumulated structures: a single file keeps the atomworks
+        path; several are sent in bounded set_states chunks, falling back to
+        per-file pushes when the listener lacks the batch loader or a chunk errors."""
+        if not batch:
+            return
+        if len(batch) == 1:
+            path, name = batch[0]
+            try:
+                _push_structure(session, path, name)
+                print(f"Loaded {name}  <-  {path}")
+            except Exception as exc:
+                print(f"Error loading {path}: {exc}", file=sys.stderr)
+            batch.clear()
+            return
+
+        total = len(batch)
+        done = 0
+        for start in range(0, total, BATCH_CHUNK):
+            chunk = batch[start : start + BATCH_CHUNK]
+            try:
+                loaded = _push_states_batch(session, chunk)
+            except Exception as exc:
+                # One chunk's RPC failed wholesale: retry it per-file so a single
+                # bad structure doesn't sink the rest of the push.
+                print(f"  ! batch chunk failed ({exc}); retrying per-file", file=sys.stderr)
+                loaded = None
+            done += _push_per_file(chunk) if loaded is None else loaded
+            if total > BATCH_CHUNK:
+                print(f"  ... {min(start + BATCH_CHUNK, total)}/{total} pushed")
+        if done == total:
+            print(f"Loaded {total} structures (batched).")
+        else:
+            print(
+                f"Loaded {done}/{total} structures; {total - done} failed on the listener.",
+                file=sys.stderr,
+            )
+        batch.clear()
+
+    # Scripts and sessions run in order; runs of structures between them batch.
+    for path in files:
+        low = path.lower()
+        if low.endswith(SCRIPT_EXTENSIONS):
+            flush_batch()
+            try:
+                _run_pml(session, path, namer)
+            except Exception as exc:
+                print(f"Error running {path}: {exc}", file=sys.stderr)
+        elif low.endswith(SESSION_EXTENSIONS):
+            flush_batch()
+            try:
+                _push_session(session, path)
+            except Exception as exc:
+                print(f"Error loading {path}: {exc}", file=sys.stderr)
+        else:
+            batch.append((path, namer.allocate(object_name(path))))
+    flush_batch()
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("start", "serve"):
+        cmd_start(argv[1:])
+        return 0
+
+    parser = argparse.ArgumentParser(
+        prog="pymr",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("files", nargs="*", help="Files, directories, or globs to push.")
+    parser.add_argument(
+        "--cycle",
+        action="store_true",
+        help="Step through structures one at a time with single keypresses "
+        "(arrows / space / n / p).",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.files:
+        parser.print_help()
+        return 1
+
+    files = expand_inputs(args.files)
+    if not files:
+        print("No matching structure / .pml / .pse files found.", file=sys.stderr)
+        return 1
+    print(f"Found {len(files)} file(s).")
+    return run_push(files, args.cycle)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

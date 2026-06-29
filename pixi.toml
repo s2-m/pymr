@@ -1,0 +1,40 @@
+[workspace]
+name = "pymr"
+version = "0.1.0"
+description = "Push structure files into a remote PyMOL over RPC — reads locally, ships bytes, no shared filesystem needed"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+# Default environment = the PUSHER (client) side: the pymol_remote client plus
+# atomworks (which pulls in biotite/rdkit/scipy/pandas — not a tiny env, but it
+# still runs fine on a headless machine).
+[dependencies]
+python = "3.11.*"
+
+[pypi-dependencies]
+# Upper-bounded: the listener bootstrap reaches into pymol_remote internals
+# (_GLOBAL_PYMOL_XMLRPC_SERVER, register_function_with_kwargs), so reject an
+# API-incompatible major bump at resolve time rather than at runtime.
+pymol-remote = ">=1.1,<2"
+atomworks = ">=2.2.1"
+
+# The VIEWER environment adds open-source PyMOL (the display + the RPC server).
+[feature.viewer.dependencies]
+pymol-open-source = "*"
+
+[feature.viewer.tasks]
+integration = "bash tests/integration.sh"
+
+# Developer tooling: linting, formatting, tests. `pixi run -e dev test`.
+[feature.dev.dependencies]
+ruff = ">=0.6"
+pytest = ">=8"
+
+[feature.dev.tasks]
+lint = "ruff check bin tests"
+format = "ruff format bin tests"
+test = "pytest -q tests/test_common.py tests/test_push.py"
+
+[environments]
+viewer = ["viewer"]
+dev = ["dev"]

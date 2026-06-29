@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""pyml — open structures or run scripts in a local open-source PyMOL.
+
+A thin launcher: it expands files/directories/globs, drops files that would
+collide on a single PyMOL object name, and launches PyMOL on the rest. Set
+$PYMR_PYMOL_BIN to use a specific PyMOL binary; otherwise `pymol` on PATH is
+used.
+
+PyMOL discovers and loads ~/.pymolrc on startup before opening any files, so
+any styles or hooks defined there (e.g. pymol_apps) apply automatically.
+Run `pymol_apps/install.sh` once to create the ~/.pymolrc symlink.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from _pymr_common import STRUCTURE_EXTENSIONS, dedupe_by_object, expand_inputs, object_name
+
+
+def resolve_pymol() -> str:
+    return os.environ.get("PYMR_PYMOL_BIN") or shutil.which("pymol") or "pymol"
+
+
+def ensure_display(env: dict) -> None:
+    """On Linux, recover a missing $DISPLAY from a running X server (e.g. a tmux
+    session that predates the graphical login). No-op on macOS (native Cocoa)."""
+    if sys.platform == "darwin" or env.get("DISPLAY"):
+        return
+    # Pick the lowest-numbered X socket owned by the current user; skipping
+    # foreign-owned displays avoids pointing PyMOL at another user's server.
+    uid = os.getuid()
+    chosen = None
+    try:
+        socks = sorted(os.listdir("/tmp/.X11-unix"))
+    except OSError:
+        socks = []
+    for sock in socks:
+        if not sock.startswith("X"):
+            continue
+        path = f"/tmp/.X11-unix/{sock}"
+        try:
+            if os.stat(path).st_uid == uid:
+                chosen = ":" + sock[1:]
+                break
+        except OSError:
+            continue
+    if chosen is None:
+        print("Note: no $DISPLAY found; PyMOL may fail to open a window.", file=sys.stderr)
+        return
+    env["DISPLAY"] = chosen
+    if not env.get("XAUTHORITY") and os.path.exists(os.path.expanduser("~/.Xauthority")):
+        env["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
+    print(f"Note: set DISPLAY={env['DISPLAY']} for PyMOL.", file=sys.stderr)
+
+
+def _write_cycle_script(pairs: list[tuple[str, str]]) -> str:
+    """Write a temp Python script that cycles *pairs* (path, obj_name) inside PyMOL.
+
+    The script is injected via ``-d "run <path>"`` so it runs after ~/.pymolrc
+    has loaded (giving access to pretty_all, color_chains_good, etc.).
+    F3/F4 step forward/back — the same keys dir_cycle.py uses for directory
+    cycling, so the mental model is consistent.  Returns the temp file path;
+    the caller is responsible for cleanup after PyMOL exits.
+    """
+    pairs_repr = repr(pairs)
+    script = f"""\
+import os
+from pymol import cmd
+
+_PAIRS = {pairs_repr}
+_ST = {{"i": -1, "obj": None}}
+
+
+def _show(idx):
+    idx = idx % len(_PAIRS)
+    path, obj = _PAIRS[idx]
+    if _ST["obj"]:
+        cmd.delete(_ST["obj"])
+    cmd.load(path, obj)
+    try:
+        pretty_all()  # noqa: F821 — provided by pretty.py via ~/.pymolrc
+    except Exception:
+        pass
+    _ST.update(i=idx, obj=obj)
+    print(f"[{{idx + 1}}/{{len(_PAIRS)}}] {{obj}}")
+
+
+def _cn(*a): _show(_ST["i"] + 1)
+def _cp(*a): _show(_ST["i"] - 1)
+
+cmd.set_key("F3", _cn)
+cmd.set_key("F4", _cp)
+cmd.extend("cycle_next", _cn)
+cmd.extend("cycle_prev", _cp)
+
+print(f"Cycling {{len(_PAIRS)}} structures — F3 next, F4 prev  (or: cycle_next / cycle_prev)")
+_show(0)
+"""
+    fd, path = tempfile.mkstemp(suffix=".py", prefix="pyml_cycle_")
+    # Self-delete once loaded: the F3/F4 callbacks live in memory afterward, so
+    # the on-disk file is unneeded. This also cleans up the detached (--bg) case,
+    # where the caller can't safely unlink it (PyMOL may not have read it yet).
+    trailer = f"\nimport os as _os\ntry:\n    _os.unlink({path!r})\nexcept OSError:\n    pass\n"
+    with os.fdopen(fd, "w") as fh:
+        fh.write(script + trailer)
+    return path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="pyml",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help="Files, directories, or globs. Omit for an empty PyMOL GUI.",
+    )
+    parser.add_argument("--bg", action="store_true", help="Launch detached from this terminal.")
+    parser.add_argument(
+        "--cycle",
+        action="store_true",
+        help="Step through structures one at a time (F3 = next, F4 = prev) instead of "
+        "loading all at once.  Non-structure files (.pml, .pse) are ignored in cycle mode.",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Show PyMOL's external GUI bar (hidden by default; -x is passed otherwise).",
+    )
+    args = parser.parse_args()
+
+    env = os.environ.copy()
+    # macOS: force the legacy QGLWidget. Open-source PyMOL ships legacy GLSL 1.20
+    # shaders that need a 2.1 compatibility context; the default QOpenGLWidget on
+    # macOS hits a context-currency bug (blank viewport or a GenericBuffer crash).
+    if sys.platform == "darwin":
+        env.setdefault("PYMOL_USE_QOPENGLWIDGET", "0")
+    ensure_display(env)
+
+    pymol_bin = resolve_pymol()
+
+    files = expand_inputs(args.files) if args.files else []
+    if args.files and not files:
+        print("No matching structure / .pml files found.", file=sys.stderr)
+        return 1
+
+    # -x hides the external Tkinter GUI bar (cleaner viewport, no mouse-routing
+    # interference with middle-click on Linux/Qt). -E 1 requests a 4x MSAA
+    # context for real-time antialiasing on the open-source build.
+    flags = ["-E", "1"] if args.gui else ["-x", "-E", "1"]
+
+    if args.cycle:
+        structs = [f for f in files if f.lower().endswith(STRUCTURE_EXTENSIONS)]
+        skipped = len(files) - len(structs)
+        if skipped:
+            print(f"(cycle mode: skipping {skipped} non-structure file(s))")
+        if not structs:
+            print("No structure files to cycle.", file=sys.stderr)
+            return 1
+        pairs = [(p, object_name(p)) for p in structs]
+        tmp = _write_cycle_script(pairs)
+        print(f"Cycling {len(pairs)} structure(s) — F3 next, F4 prev")
+        launch_cmd = [pymol_bin, *flags, "-d", f"run {tmp}"]
+        if args.bg:
+            # The script self-deletes once PyMOL loads it; don't unlink here, as
+            # the freshly spawned PyMOL may not have read it yet.
+            subprocess.Popen(
+                launch_cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return 0
+        try:
+            return subprocess.call(launch_cmd, env=env)
+        finally:
+            # Belt-and-suspenders: the script self-deletes, but clean up here too
+            # in case PyMOL never ran it.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+    kept, dropped = dedupe_by_object(files)
+    if dropped:
+        shown = ", ".join(os.path.basename(d) for d in dropped[:4])
+        suffix = " ..." if len(dropped) > 4 else ""
+        print(f"Skipped {len(dropped)} duplicate-object file(s): {shown}{suffix}")
+
+    launch_cmd = [pymol_bin, *flags, *kept]
+    if args.bg:
+        subprocess.Popen(
+            launch_cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return 0
+    return subprocess.call(launch_cmd, env=env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
