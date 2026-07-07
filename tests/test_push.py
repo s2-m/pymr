@@ -1,9 +1,9 @@
 """Unit tests for the push-side helpers in the `pymr` script: format mapping,
 batch-loader detection, the batched byte-push, and `load`-line interception.
 
-The launcher is an extension-less script, so it's loaded by path. `atomworks`
-is a required top-level import in `pymr`; it is available in all pixi envs
-(including `dev`) via the workspace-level `[pypi-dependencies]`.
+The launcher is an extension-less script, so it's loaded by path. It has no
+third-party top-level imports (`pymol_remote` is imported lazily inside the RPC
+helpers), so loading it by path needs nothing beyond the stdlib.
 """
 
 import gzip
@@ -64,8 +64,14 @@ def test_file_format(pymr, path, expected):
 
 
 def test_server_has(pymr):
-    assert pymr._server_has(FakeSession(has_set_states=True), "set_states") is True
-    assert pymr._server_has(FakeSession(has_set_states=False), "set_states") is False
+    assert (
+        pymr._server_has(FakeSession(has_set_states=True), "set_states")
+        is True
+    )
+    assert (
+        pymr._server_has(FakeSession(has_set_states=False), "set_states")
+        is False
+    )
 
 
 def test_push_states_batch_sends_raw_bytes_and_count(pymr, tmp_path):
@@ -76,7 +82,9 @@ def test_push_states_batch_sends_raw_bytes_and_count(pymr, tmp_path):
     already_gz.write_bytes(gz_bytes)
 
     session = FakeSession(has_set_states=True)
-    loaded = pymr._push_states_batch(session, [(str(plain), "x"), (str(already_gz), "y")])
+    loaded = pymr._push_states_batch(
+        session, [(str(plain), "x"), (str(already_gz), "y")]
+    )
 
     assert loaded == 2  # server-reported load count, not a bare bool
     (buf_x, name_x, fmt_x), (buf_y, name_y, fmt_y) = session.sent
@@ -94,7 +102,9 @@ def test_push_states_batch_skips_unreadable_file(pymr, tmp_path):
     missing = tmp_path / "gone.pdb"  # never created -> open() raises
 
     session = FakeSession(has_set_states=True)
-    loaded = pymr._push_states_batch(session, [(str(good), "good"), (str(missing), "gone")])
+    loaded = pymr._push_states_batch(
+        session, [(str(good), "good"), (str(missing), "gone")]
+    )
 
     # The bad file is skipped, not fatal; the good one still loads.
     assert loaded == 1
@@ -128,19 +138,69 @@ def test_maybe_intercept_load_accepts_local_structure(
     assert name == expected_name
 
 
-def test_maybe_intercept_load_passes_through_keyword_and_missing(pymr, tmp_path, monkeypatch):
+def test_maybe_intercept_load_passes_through_keyword_and_missing(
+    pymr, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "model.pdb").write_bytes(b"ATOM\n")
-    # state=2 is a load kwarg, not an object name -> don't byte-push, pass through.
+    # state=2 is a load kwarg, not an object name -> don't byte-push, pass
+    # through.
     assert pymr._maybe_intercept_load("load model.pdb, state=2") is None
     # Non-existent local path / non-structure -> not intercepted.
     assert pymr._maybe_intercept_load("load nope.pdb") is None
     assert pymr._maybe_intercept_load("bg_color white") is None
 
 
-def test_maybe_intercept_load_handles_quoted_path_with_space(pymr, tmp_path, monkeypatch):
+def test_maybe_intercept_load_handles_quoted_path_with_space(
+    pymr, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "my model.pdb").write_bytes(b"ATOM\n")
     hit = pymr._maybe_intercept_load('load "my model.pdb"')
     assert hit is not None
     assert hit[0] == str(tmp_path / "my model.pdb")
+
+
+class ReplaySession:
+    """Records do()/set_state() calls for `_replay_commands` tests."""
+
+    def __init__(self):
+        self.dos = []
+        self.loaded = []  # (object, format) pairs from set_state
+
+    def do(self, cmd):
+        self.dos.append(cmd)
+
+    def set_state(self, data, object, format):
+        self.loaded.append((object, format))
+
+
+def test_replay_commands_pushes_loads_and_forwards_rest(
+    pymr, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "m.pdb").write_bytes(b"ATOM\n")
+    session = ReplaySession()
+    lines = [
+        "load m.pdb, ref",  # local structure -> byte-push
+        "color red, ref",  # not a load -> forwarded to the listener
+        "# a comment",  # skipped
+        "",  # blank -> skipped
+    ]
+    pymr._replay_commands(session, lines, pymr.UniqueNamer(), "-d")
+    # The load was pushed as raw bytes under the given object name.
+    assert ("ref", "pdb") in session.loaded
+    # Everything else is forwarded verbatim (plus the push's delete).
+    assert "color red, ref" in session.dos
+    assert "delete ref" in session.dos
+
+
+def test_run_do_splits_on_semicolons(pymr, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "m.pdb").write_bytes(b"ATOM\n")
+    session = ReplaySession()
+    monkeypatch.setattr(pymr, "_connect", lambda: session)
+    # A `pymol -d`-style string: ';' separates the load from the command.
+    assert pymr.run_do("load m.pdb, ref; color red, ref") == 0
+    assert ("ref", "pdb") in session.loaded
+    assert "color red, ref" in session.dos

@@ -1,11 +1,12 @@
 # Ruff config for the pymr launchers. The two entry points are extension-less
 # executables, so include them explicitly alongside the .py module.
 target-version = "py311"
-line-length = 100
+line-length = 79  # PEP 8 maximum line length
 extend-include = ["bin/pymr", "bin/pyml"]
 
 [lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "C4", "PIE", "PT", "PERF"]
+# E/W = pycodestyle (PEP 8 layout & whitespace), N = pep8-naming (PEP 8 names).
+select = ["E", "F", "W", "N", "I", "UP", "B", "SIM", "RUF", "C4", "PIE", "PT", "PERF"]
 # BLE001: broad `except Exception` is intentional around best-effort RPC/IO and
 # optional imports — enumerating every transport error would be fragile.
 # PERF203: try-except inside loops is intentional in _set_states (per-item error

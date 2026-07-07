@@ -21,7 +21,12 @@ import subprocess
 import sys
 import tempfile
 
-from _pymr_common import STRUCTURE_EXTENSIONS, dedupe_by_object, expand_inputs, object_name
+from _pymr_common import (
+    STRUCTURE_EXTENSIONS,
+    dedupe_by_object,
+    expand_inputs,
+    object_name,
+)
 
 
 def resolve_pymol() -> str:
@@ -29,8 +34,9 @@ def resolve_pymol() -> str:
 
 
 def ensure_display(env: dict) -> None:
-    """On Linux, recover a missing $DISPLAY from a running X server (e.g. a tmux
-    session that predates the graphical login). No-op on macOS (native Cocoa)."""
+    """On Linux, recover a missing $DISPLAY from a running X server (e.g. a
+    tmux session that predates the graphical login). No-op on macOS (native
+    Cocoa)."""
     if sys.platform == "darwin" or env.get("DISPLAY"):
         return
     # Pick the lowest-numbered X socket owned by the current user; skipping
@@ -52,16 +58,22 @@ def ensure_display(env: dict) -> None:
         except OSError:
             continue
     if chosen is None:
-        print("Note: no $DISPLAY found; PyMOL may fail to open a window.", file=sys.stderr)
+        print(
+            "Note: no $DISPLAY found; PyMOL may fail to open a window.",
+            file=sys.stderr,
+        )
         return
     env["DISPLAY"] = chosen
-    if not env.get("XAUTHORITY") and os.path.exists(os.path.expanduser("~/.Xauthority")):
+    if not env.get("XAUTHORITY") and os.path.exists(
+        os.path.expanduser("~/.Xauthority")
+    ):
         env["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
     print(f"Note: set DISPLAY={env['DISPLAY']} for PyMOL.", file=sys.stderr)
 
 
 def _write_cycle_script(pairs: list[tuple[str, str]]) -> str:
-    """Write a temp Python script that cycles *pairs* (path, obj_name) inside PyMOL.
+    """Write a temp Python script that cycles *pairs* (path, obj_name)
+    inside PyMOL.
 
     The script is injected via ``-d "run <path>"`` so it runs after ~/.pymolrc
     has loaded (giving access to pretty_all, color_chains_good, etc.).
@@ -100,14 +112,21 @@ cmd.set_key("F4", _cp)
 cmd.extend("cycle_next", _cn)
 cmd.extend("cycle_prev", _cp)
 
-print(f"Cycling {{len(_PAIRS)}} structures — F3 next, F4 prev  (or: cycle_next / cycle_prev)")
+print(
+    f"Cycling {{len(_PAIRS)}} structures — F3 next, F4 prev  "
+    f"(or: cycle_next / cycle_prev)"
+)
 _show(0)
 """
     fd, path = tempfile.mkstemp(suffix=".py", prefix="pyml_cycle_")
     # Self-delete once loaded: the F3/F4 callbacks live in memory afterward, so
-    # the on-disk file is unneeded. This also cleans up the detached (--bg) case,
+    # the on-disk file is unneeded. This also cleans up the detached (--bg)
+    # case,
     # where the caller can't safely unlink it (PyMOL may not have read it yet).
-    trailer = f"\nimport os as _os\ntry:\n    _os.unlink({path!r})\nexcept OSError:\n    pass\n"
+    trailer = (
+        f"\nimport os as _os\ntry:\n    _os.unlink({path!r})\n"
+        f"except OSError:\n    pass\n"
+    )
     with os.fdopen(fd, "w") as fh:
         fh.write(script + trailer)
     return path
@@ -124,24 +143,29 @@ def main() -> int:
         nargs="*",
         help="Files, directories, or globs. Omit for an empty PyMOL GUI.",
     )
-    parser.add_argument("--bg", action="store_true", help="Launch detached from this terminal.")
+    parser.add_argument(
+        "--bg", action="store_true", help="Launch detached from this terminal."
+    )
     parser.add_argument(
         "--cycle",
         action="store_true",
-        help="Step through structures one at a time (F3 = next, F4 = prev) instead of "
-        "loading all at once.  Non-structure files (.pml, .pse) are ignored in cycle mode.",
+        help="Step through structures one at a time (F3 = next, F4 = prev) "
+        "instead of loading all at once.  Non-structure files (.pml, .pse) "
+        "are ignored in cycle mode.",
     )
     parser.add_argument(
         "--gui",
         action="store_true",
-        help="Show PyMOL's external GUI bar (hidden by default; -x is passed otherwise).",
+        help="Show PyMOL's external GUI bar (hidden by default; -x is passed "
+        "otherwise).",
     )
     args = parser.parse_args()
 
     env = os.environ.copy()
-    # macOS: force the legacy QGLWidget. Open-source PyMOL ships legacy GLSL 1.20
-    # shaders that need a 2.1 compatibility context; the default QOpenGLWidget on
-    # macOS hits a context-currency bug (blank viewport or a GenericBuffer crash).
+    # macOS: force the legacy QGLWidget. Open-source PyMOL ships legacy GLSL
+    # 1.20 shaders that need a 2.1 compatibility context; the default
+    # QOpenGLWidget on macOS hits a context-currency bug (blank viewport or a
+    # GenericBuffer crash).
     if sys.platform == "darwin":
         env.setdefault("PYMOL_USE_QOPENGLWIDGET", "0")
     ensure_display(env)
@@ -159,7 +183,9 @@ def main() -> int:
     flags = ["-E", "1"] if args.gui else ["-x", "-E", "1"]
 
     if args.cycle:
-        structs = [f for f in files if f.lower().endswith(STRUCTURE_EXTENSIONS)]
+        structs = [
+            f for f in files if f.lower().endswith(STRUCTURE_EXTENSIONS)
+        ]
         skipped = len(files) - len(structs)
         if skipped:
             print(f"(cycle mode: skipping {skipped} non-structure file(s))")
@@ -171,7 +197,8 @@ def main() -> int:
         print(f"Cycling {len(pairs)} structure(s) — F3 next, F4 prev")
         launch_cmd = [pymol_bin, *flags, "-d", f"run {tmp}"]
         if args.bg:
-            # The script self-deletes once PyMOL loads it; don't unlink here, as
+            # The script self-deletes once PyMOL loads it; don't unlink
+            # here, as
             # the freshly spawned PyMOL may not have read it yet.
             subprocess.Popen(
                 launch_cmd,
@@ -184,7 +211,8 @@ def main() -> int:
         try:
             return subprocess.call(launch_cmd, env=env)
         finally:
-            # Belt-and-suspenders: the script self-deletes, but clean up here too
+            # Belt-and-suspenders: the script self-deletes, but clean up
+            # here too
             # in case PyMOL never ran it.
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
@@ -193,7 +221,9 @@ def main() -> int:
     if dropped:
         shown = ", ".join(os.path.basename(d) for d in dropped[:4])
         suffix = " ..." if len(dropped) > 4 else ""
-        print(f"Skipped {len(dropped)} duplicate-object file(s): {shown}{suffix}")
+        print(
+            f"Skipped {len(dropped)} duplicate-object file(s): {shown}{suffix}"
+        )
 
     launch_cmd = [pymol_bin, *flags, *kept]
     if args.bg:

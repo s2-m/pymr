@@ -74,11 +74,10 @@ a handful of round-trips rather than one per file. Older listeners without the
 batch loader work fine — the pusher falls back to per-file pushes automatically.
 The HTTP transport gzips request bodies, so nothing is pre-compressed on the wire.
 
-Single-structure pushes use [`atomworks`](https://github.com/RosettaCommons/atomworks)
-`view_pymol` for normalized serialization (and to read BCIF inputs); a raw
-byte-push fallback handles formats atomworks can't serialize (e.g. density maps).
-Multi-file/directory pushes ship raw bytes through `set_states` (atomworks is not
-involved unless the listener lacks the batch loader).
+Every push ships the raw file bytes, so the listener loads each structure exactly
+as it is on disk — no re-serialization, no reformatting, numbering and chains
+preserved. PyMOL reads the format from the bytes; files already gzipped on disk
+(`.gz`, `.pse.gz`) are forwarded as-is.
 
 ## Local viewing
 

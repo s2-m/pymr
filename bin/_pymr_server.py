@@ -14,8 +14,9 @@ def _set_states(items: list) -> int:
     """Load many structures in one call.
 
     Each item is ``[buffer, object, format]``; *buffer* is the (optionally
-    gzipped) file bytes — PyMOL auto-detects the gzip magic regardless of the
-    temp file's extension. Returns the number of structures successfully loaded.
+    gzipped) file bytes — PyMOL auto-detects the gzip magic regardless of
+    the temp file's extension. Returns the number of structures
+    successfully loaded.
     """
     import tempfile
 
@@ -23,9 +24,13 @@ def _set_states(items: list) -> int:
 
     loaded = 0
     for buffer, obj, fmt in items:
-        data = getattr(buffer, "data", buffer)  # xmlrpc Binary -> bytes if needed
+        data = getattr(
+            buffer, "data", buffer
+        )  # xmlrpc Binary -> bytes if needed
         try:
-            with tempfile.NamedTemporaryFile(delete=True, suffix="." + fmt) as tmp:
+            with tempfile.NamedTemporaryFile(
+                delete=True, suffix="." + fmt
+            ) as tmp:
                 with open(tmp.name, "wb") as fh:
                     fh.write(data)
                 cmd.delete(obj)
@@ -37,11 +42,11 @@ def _set_states(items: list) -> int:
 
 
 def _enable_token_auth(srv) -> None:
-    """Reject RPC requests without a matching ``X-Pymol-Token`` when a token is
-    configured — the listener otherwise runs arbitrary code with no auth, and on
-    a shared machine the loopback port is guessable. Swaps the live server's
-    ``RequestHandlerClass``; the pusher connects after the tunnel is up, so it
-    picks up the new handler.
+    """Reject RPC requests without a matching ``X-Pymol-Token`` when a
+    token is configured — the listener otherwise runs arbitrary code with
+    no auth, and on a shared machine the loopback port is guessable. Swaps
+    the live server's ``RequestHandlerClass``; the pusher connects after the
+    tunnel is up, so it picks up the new handler.
     """
     import hmac
 
@@ -55,7 +60,7 @@ def _enable_token_auth(srv) -> None:
     base = srv.RequestHandlerClass
 
     class _AuthRequestHandler(base):
-        def do_POST(self):  # BaseHTTPRequestHandler dispatch name
+        def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler dispatch name
             sent = self.headers.get("X-Pymol-Token", "")
             if not hmac.compare_digest(sent, token):
                 self.close_connection = True

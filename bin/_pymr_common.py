@@ -15,8 +15,11 @@ DEFAULT_TOKEN_FILE = "~/.config/pymr/token"
 
 
 def token_file() -> str:
-    """Path to the shared-secret file ($PYMR_TOKEN_FILE or ~/.config/pymr/token)."""
-    return os.path.expanduser(os.environ.get("PYMR_TOKEN_FILE") or DEFAULT_TOKEN_FILE)
+    """Path to the shared-secret file ($PYMR_TOKEN_FILE or
+    ~/.config/pymr/token)."""
+    return os.path.expanduser(
+        os.environ.get("PYMR_TOKEN_FILE") or DEFAULT_TOKEN_FILE
+    )
 
 
 def resolve_token() -> str | None:
@@ -67,7 +70,8 @@ _STRUCTURE_BASE: tuple[str, ...] = (
     ".pkl",
 )
 
-# Gzip variants: only compound extensions (e.g. .pdb.gz) — bare .gz is excluded.
+# Gzip variants: only compound extensions (e.g. .pdb.gz) — bare .gz is
+# excluded.
 _STRUCTURE_GZ: tuple[str, ...] = tuple(ext + ".gz" for ext in _STRUCTURE_BASE)
 
 STRUCTURE_EXTENSIONS: tuple[str, ...] = _STRUCTURE_BASE + _STRUCTURE_GZ
@@ -78,8 +82,11 @@ SUPPORTED_EXTENSIONS: tuple[str, ...] = (
     STRUCTURE_EXTENSIONS + SCRIPT_EXTENSIONS + SESSION_EXTENSIONS
 )
 
-# Suffixes stripped when deriving an object name (up to two passes, so .pdb.gz → foo).
-_NAME_SUFFIXES: frozenset[str] = frozenset((".gz", ".pml", ".pse", ".pze", *_STRUCTURE_BASE))
+# Suffixes stripped when deriving an object name (up to two passes, so
+# .pdb.gz → foo).
+_NAME_SUFFIXES: frozenset[str] = frozenset(
+    (".gz", ".pml", ".pse", ".pze", *_STRUCTURE_BASE)
+)
 
 
 def expand_inputs(
@@ -123,8 +130,8 @@ def _expand_one(path: str, extensions: tuple[str, ...]) -> list[str]:
 
 
 def object_name(path: str) -> str:
-    """The base object name PyMOL would give *path*, dropping up to two suffixes
-    so ``foo.cif`` and ``foo.cif.gz`` both yield ``foo``."""
+    """The base object name PyMOL would give *path*, dropping up to two
+    suffixes so ``foo.cif`` and ``foo.cif.gz`` both yield ``foo``."""
     base = os.path.basename(path)
     for _ in range(2):
         stem, ext = os.path.splitext(base)
@@ -137,11 +144,12 @@ def object_name(path: str) -> str:
 
 def dedupe_by_object(files: list[str]) -> tuple[list[str], list[str]]:
     """Partition *files* into ``(kept, dropped)`` so no two kept structures
-    collapse to the same PyMOL object name (e.g. ``foo.cif`` and ``foo.cif.gz``).
+    collapse to the same PyMOL object name (e.g. ``foo.cif`` and
+    ``foo.cif.gz``).
 
-    Scripts (``.pml``) are always kept — they create no object. Used by the local
-    launcher, where files share one PyMOL command line and a name collision is a
-    hard load error.
+    Scripts (``.pml``) are always kept — they create no object. Used by the
+    local launcher, where files share one PyMOL command line and a name
+    collision is a hard load error.
     """
     kept: list[str] = []
     dropped: list[str] = []
@@ -160,8 +168,9 @@ def dedupe_by_object(files: list[str]) -> tuple[list[str], list[str]]:
 
 
 class UniqueNamer:
-    """Allocate collision-free PyMOL object names, appending ``_2``, ``_3`` … on
-    reuse (e.g. ``model.cif`` from two directories becomes ``model``, ``model_2``).
+    """Allocate collision-free PyMOL object names, appending ``_2``, ``_3`` …
+    on reuse (e.g. ``model.cif`` from two directories becomes ``model``,
+    ``model_2``).
     Used by the remote pusher, where each structure is loaded under an explicit
     name and a collision would otherwise silently overwrite the previous one.
     """

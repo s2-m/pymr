@@ -5,9 +5,9 @@ description = "Push structure files into a remote PyMOL over RPC — reads local
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64"]
 
-# Default environment = the PUSHER (client) side: the pymol_remote client plus
-# atomworks (which pulls in biotite/rdkit/scipy/pandas — not a tiny env, but it
-# still runs fine on a headless machine).
+# Default environment = the PUSHER (client) side: just the pymol_remote client.
+# Structures ship as raw file bytes, so there's no structure-parsing dependency
+# here — the env stays tiny and runs fine on a headless machine.
 [dependencies]
 python = "3.11.*"
 
@@ -16,7 +16,6 @@ python = "3.11.*"
 # (_GLOBAL_PYMOL_XMLRPC_SERVER, register_function_with_kwargs), so reject an
 # API-incompatible major bump at resolve time rather than at runtime.
 pymol-remote = ">=1.1,<2"
-atomworks = ">=2.2.1"
 
 # The VIEWER environment adds open-source PyMOL (the display + the RPC server).
 [feature.viewer.dependencies]

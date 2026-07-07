@@ -1,4 +1,5 @@
-"""Unit tests for the pure helpers in `_pymr_common` (no PyMOL/RPC required)."""
+"""Unit tests for the pure helpers in `_pymr_common` (no PyMOL/RPC
+required)."""
 
 import os
 
@@ -15,7 +16,10 @@ import pytest
         ("/a/b/model.pdb", "model"),
         ("/a/b/model.cif.gz", "model"),
         ("run.pml", "run"),
-        ("weird.v2.pdb", "weird.v2"),  # only known structure suffixes are stripped
+        (
+            "weird.v2.pdb",
+            "weird.v2",
+        ),  # only known structure suffixes are stripped
         ("noext", "noext"),
     ],
 )
@@ -46,7 +50,9 @@ def test_expand_inputs_preserves_command_line_order(tmp_path):
     b = _touch(tmp_path / "b.pdb")
 
     # Explicit args keep their typed order — not re-sorted alphabetically.
-    assert common.expand_inputs([c, a, b]) == [os.path.abspath(p) for p in (c, a, b)]
+    assert common.expand_inputs([c, a, b]) == [
+        os.path.abspath(p) for p in (c, a, b)
+    ]
 
 
 def test_expand_inputs_dedupe_keeps_first_position(tmp_path):
@@ -54,7 +60,10 @@ def test_expand_inputs_dedupe_keeps_first_position(tmp_path):
     a = _touch(tmp_path / "a.pdb")
 
     # Duplicate drops to its first occurrence; order otherwise as given.
-    assert common.expand_inputs([b, a, b]) == [os.path.abspath(b), os.path.abspath(a)]
+    assert common.expand_inputs([b, a, b]) == [
+        os.path.abspath(b),
+        os.path.abspath(a),
+    ]
 
 
 def test_expand_inputs_glob(tmp_path):
